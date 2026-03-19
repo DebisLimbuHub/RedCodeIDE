@@ -1,0 +1,17 @@
+import TerminalPanel from "../components/TerminalPanel";
+
+export default function ReconWorkspace() {
+  return (
+    <div className="flex h-full flex-col bg-surface-950">
+      {/* Workspace header */}
+      <div className="flex h-9 shrink-0 items-center border-b border-surface-700 bg-surface-900 px-4">
+        <span className="text-xs font-semibold uppercase tracking-widest text-accent-red">
+          Recon
+        </span>
+      </div>
+
+      {/* Terminal fills the rest */}
+      <TerminalPanel className="flex-1" />
+    </div>
+  );
+}

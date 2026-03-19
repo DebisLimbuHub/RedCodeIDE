@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --version)",
+      "Bash(cargo --version)",
+      "Bash(rustc --version)",
+      "Bash(cargo tauri:*)",
+      "Bash(npm --version)",
+      "Bash(npx --version)",
+      "Read(//home/akira/.cargo/**)",
+      "Bash(echo \"PATH: $PATH\")",
+      "Bash(npm install:*)",
+      "Bash(curl -fsSL https://get.pnpm.io/install.sh)",
+      "Bash(sh -s --)",
+      "Bash(export PNPM_HOME=\"/home/akira/.local/share/pnpm\")",
+      "Bash(export PATH=\"$PNPM_HOME:$PATH\")",
+      "Bash(curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs)",
+      "Bash(sh -s -- -y --no-modify-path)",
+      "Bash(source \"$HOME/.cargo/env\")",
+      "Bash(cargo install:*)",
+      "Bash(dpkg -l)",
+      "Bash(apt-cache search:*)",
+      "Bash(sudo apt-get:*)",
+      "Bash(pkg-config --exists webkit2gtk-4.1)",
+      "Bash(pkg-config --exists gtk+-3.0)",
+      "Bash(sudo -n true)",
+      "Bash(convert \"/home/akira/Desktop/VS Projects/RedCodeIDE/src-tauri/icons/icon.png\" -resize 512x512 \"/tmp/icon512.png\")",
+      "Bash(pnpm install:*)",
+      "Bash(pnpm approve-builds:*)",
+      "Bash(pnpm rebuild:*)",
+      "Bash(node node_modules/esbuild/install.js)",
+      "Bash(npm rebuild:*)",
+      "Bash(pnpm exec:*)",
+      "Bash(cargo check:*)",
+      "Bash(pkg-config --exists glib-2.0)",
+      "Bash(apt-cache show:*)",
+      "Bash(pkexec apt-get:*)",
+      "Bash(pnpm build:*)",
+      "Bash(timeout 30 pnpm tauri dev)"
+    ]
+  }
+}
