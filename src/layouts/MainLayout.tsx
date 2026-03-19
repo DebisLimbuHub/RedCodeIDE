@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { Outlet, NavLink } from "react-router-dom";
 import { clsx } from "clsx";
 import {
@@ -8,6 +9,8 @@ import {
   Archive,
   Settings,
 } from "lucide-react";
+import EngagementSelector from "../components/EngagementSelector";
+import { useEngagementStore } from "../stores/engagementStore";
 
 const navItems = [
   { path: "/recon", label: "Recon", icon: Search },
@@ -19,6 +22,13 @@ const navItems = [
 ];
 
 export default function MainLayout() {
+  const loadMostRecent = useEngagementStore((s) => s.loadMostRecent);
+
+  // Auto-load most recent active engagement on first mount.
+  useEffect(() => {
+    loadMostRecent();
+  }, []);
+
   return (
     <div className="flex h-full bg-surface-950 text-gray-100">
       {/* Sidebar */}
@@ -47,10 +57,18 @@ export default function MainLayout() {
         ))}
       </aside>
 
-      {/* Main content */}
-      <main className="flex-1 overflow-hidden">
-        <Outlet />
-      </main>
+      {/* Right column: topbar + content */}
+      <div className="flex min-w-0 flex-1 flex-col">
+        {/* Topbar */}
+        <header className="flex h-10 shrink-0 items-center border-b border-surface-700 bg-surface-900 px-3">
+          <EngagementSelector />
+        </header>
+
+        {/* Workspace content */}
+        <main className="flex-1 overflow-hidden">
+          <Outlet />
+        </main>
+      </div>
     </div>
   );
 }
