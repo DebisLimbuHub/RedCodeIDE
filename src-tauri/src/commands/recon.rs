@@ -174,13 +174,36 @@ pub fn add_recon_data(
     let now = chrono::Utc::now().to_rfc3339();
     let confidence = 0.9_f64;
 
-    db.execute(
+    let inserted = db.execute(
         "INSERT OR IGNORE INTO recon_data \
          (id, engagement_id, target_id, data_type, value, source, confidence, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![id, engagement_id, target_id, data_type, value, source, confidence, now],
     )
     .map_err(|e| e.to_string())?;
+
+    if inserted == 0 {
+        return db
+            .query_row(
+                "SELECT id, engagement_id, target_id, data_type, value, source, confidence, created_at \
+                 FROM recon_data \
+                 WHERE engagement_id = ?1 AND data_type = ?2 AND value = ?3",
+                params![engagement_id, data_type, value],
+                |row| {
+                    Ok(ReconEntry {
+                        id: row.get(0)?,
+                        engagement_id: row.get(1)?,
+                        target_id: row.get(2)?,
+                        data_type: row.get(3)?,
+                        value: row.get(4)?,
+                        source: row.get(5)?,
+                        confidence: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(|e| e.to_string());
+    }
 
     Ok(ReconEntry {
         id,

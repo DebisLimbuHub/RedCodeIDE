@@ -1,21 +1,14 @@
 /**
  * ReconLauncher — modal for browsing, configuring, and executing recon skill
- * commands in the embedded terminal.
+ * commands through the active embedded terminal session.
  *
- * Injection mechanism:
- *   When the user clicks "Run", the full command string (+ \r) is written to
- *   the active PTY session via invoke("write_terminal", …).  The Rust handler
- *   performs a scope check before allowing the newline to reach the shell, so
- *   out-of-scope targets are still blocked even when launched from here.
- *
- * Pipeline:
- *   "Full Recon Pipeline" queues the ordered PIPELINE_COMMANDS, sending them
- *   one at a time.  The user clicks "Next Step" after each command finishes in
- *   the terminal, or uses the auto-advance timer.
+ * The launcher preserves the existing PTY injection flow, but now wraps each
+ * launcher-driven run with capture markers so output can be parsed and stored
+ * in recon_data / scope_targets after the command completes.
  */
 
-import { useState, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { clsx } from "clsx";
 import {
   X,
@@ -36,16 +29,25 @@ import {
   Clock,
   AlertCircle,
   Copy,
+  LoaderCircle,
   type LucideIcon,
 } from "lucide-react";
 import { useTerminalStore } from "../stores/terminalStore";
+import { useEngagementStore } from "../stores/engagementStore";
 import {
-  RECON_COMMANDS,
-  RECON_CATEGORIES,
+  executeAndPersistReconCommand,
+  getPersistedSubdomainHosts,
+  type ReconRunResult,
+} from "../lib/recon-execution";
+import {
+  PIPELINE_DISCOVERY_IDS,
+  PIPELINE_HOST_FANOUT_IDS,
   QUICK_RECON_IDS,
-  PIPELINE_COMMANDS,
-  type ReconCommand,
+  RECON_CATEGORIES,
+  RECON_COMMAND_BY_ID,
+  RECON_COMMANDS,
   type ReconCategory,
+  type ReconCommand,
 } from "../lib/recon-commands";
 
 // ---------------------------------------------------------------------------
@@ -53,16 +55,17 @@ import {
 // ---------------------------------------------------------------------------
 
 type LauncherMode = "browse" | "quickRecon" | "pipeline";
-
+type PipelineStatus = "idle" | "running" | "paused" | "done" | "cancelled";
 type PipelineStepStatus = "pending" | "running" | "done" | "skipped" | "error";
 
 interface PipelineStep {
+  key: string;
+  label: string;
   command: ReconCommand;
   params: Record<string, string>;
   status: PipelineStepStatus;
+  host?: string;
 }
-
-type PipelineStatus = "idle" | "running" | "paused" | "done" | "cancelled";
 
 // ---------------------------------------------------------------------------
 // Category icon map
@@ -80,58 +83,166 @@ const CATEGORY_ICONS: Record<ReconCategory, LucideIcon> = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const textEncoder = new TextEncoder();
-
-async function sendCommandToTerminal(
-  sessionId: string,
-  commandStr: string
-): Promise<void> {
-  const bytes = textEncoder.encode(commandStr + "\r");
-  await invoke("write_terminal", {
-    id: sessionId,
-    data: Array.from(bytes),
-  });
-}
-
 function validateParams(
   cmd: ReconCommand,
   values: Record<string, string>
 ): string | null {
-  for (const p of cmd.params) {
-    if (p.required && !values[p.name]?.trim()) {
-      return `"${p.label}" is required.`;
+  for (const param of cmd.params) {
+    if (param.required && !values[param.name]?.trim()) {
+      return `"${param.label}" is required.`;
     }
   }
   return null;
 }
 
+function applyParamDefaults(
+  cmd: ReconCommand,
+  values: Record<string, string>
+): Record<string, string> {
+  return Object.fromEntries(
+    cmd.params.map((param) => [
+      param.name,
+      values[param.name] ?? param.defaultValue ?? "",
+    ])
+  );
+}
+
+function buildPreviewParams(
+  cmd: ReconCommand,
+  values: Record<string, string>
+): Record<string, string> {
+  return Object.fromEntries(
+    cmd.params.map((param) => [
+      param.name,
+      values[param.name] ?? param.defaultValue ?? param.placeholder,
+    ])
+  );
+}
+
+function deriveSeedParams(initialTargetValue?: string | null): Record<string, string> {
+  if (!initialTargetValue) return {};
+  const trimmed = initialTargetValue.trim();
+  if (!trimmed) return {};
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      return {
+        domain: parsed.hostname,
+        url: parsed.toString(),
+        company_name: parsed.hostname.replace(/\.[^.]+$/, "").replace(/[.-]+/g, " "),
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  return {
+    domain: trimmed,
+    url: `https://${trimmed}`,
+    company_name: trimmed.replace(/\.[^.]+$/, "").replace(/[.-]+/g, " "),
+  };
+}
+
+function deriveCompanyName(params: Record<string, string>): string {
+  if (params.company_name?.trim()) return params.company_name.trim();
+  if (!params.domain?.trim()) return "";
+  return params.domain
+    .trim()
+    .split(".")[0]
+    .replace(/[-_]+/g, " ");
+}
+
+function unique(values: Iterable<string>): string[] {
+  return [...new Set(Array.from(values).filter(Boolean))];
+}
+
+function buildPipelineDiscoverySteps(sharedParams: Record<string, string>): PipelineStep[] {
+  return PIPELINE_DISCOVERY_IDS.map((id, index) => {
+    const command = RECON_COMMAND_BY_ID[id];
+    const params: Record<string, string> = {};
+
+    if (id === "domain_discovery") {
+      params.company_name = deriveCompanyName(sharedParams);
+    }
+    if (
+      id === "subdomain_enumeration" ||
+      id === "certificate_transparency" ||
+      id === "dns_intelligence"
+    ) {
+      params.domain = sharedParams.domain ?? "";
+    }
+
+    return {
+      key: `${id}-${index}`,
+      label: command.name,
+      command,
+      params,
+      status: "pending",
+    };
+  });
+}
+
+function buildPipelineHostSteps(hosts: string[]): PipelineStep[] {
+  const normalizedHosts = unique(hosts.map((host) => host.trim().toLowerCase()));
+  const steps: PipelineStep[] = [];
+
+  normalizedHosts.forEach((host) => {
+    PIPELINE_HOST_FANOUT_IDS.forEach((id) => {
+      const command = RECON_COMMAND_BY_ID[id];
+      const params: Record<string, string> = {};
+
+      if (id === "tls_certificate_analysis") {
+        params.host = host;
+        params.port = "443";
+      } else {
+        params.url = `https://${host}`;
+      }
+
+      steps.push({
+        key: `${id}-${host}`,
+        label: `${command.name} • ${host}`,
+        command,
+        params,
+        status: "pending",
+        host,
+      });
+    });
+  });
+
+  return steps;
+}
+
 // ---------------------------------------------------------------------------
-// ParamForm — shared param input form
+// Shared param form
 // ---------------------------------------------------------------------------
 
 function ParamForm({
   cmd,
   values,
   onChange,
+  disabled = false,
 }: {
   cmd: ReconCommand;
   values: Record<string, string>;
-  onChange: (name: string, val: string) => void;
+  onChange: (name: string, value: string) => void;
+  disabled?: boolean;
 }) {
   return (
     <div className="space-y-2">
-      {cmd.params.map((p) => (
-        <div key={p.name} className="flex flex-col gap-1">
+      {cmd.params.map((param) => (
+        <div key={param.name} className="flex flex-col gap-1">
           <label className="text-[11px] font-medium text-gray-400">
-            {p.label}
-            {p.required && <span className="ml-0.5 text-accent-red">*</span>}
+            {param.label}
+            {param.required && <span className="ml-0.5 text-accent-red">*</span>}
           </label>
           <input
-            type={p.type === "number" ? "number" : "text"}
-            value={values[p.name] ?? p.defaultValue ?? ""}
-            onChange={(e) => onChange(p.name, e.target.value)}
-            placeholder={p.placeholder}
-            className="rounded border border-surface-600 bg-surface-800 px-2 py-1.5 font-mono text-xs text-gray-200 outline-none focus:border-accent-red/50"
+            type={param.type === "number" ? "number" : "text"}
+            value={values[param.name] ?? param.defaultValue ?? ""}
+            onChange={(event) => onChange(param.name, event.target.value)}
+            placeholder={param.placeholder}
+            disabled={disabled}
+            className="rounded border border-surface-600 bg-surface-800 px-2 py-1.5 font-mono text-xs text-gray-200 outline-none focus:border-accent-red/50 disabled:opacity-50"
           />
         </div>
       ))}
@@ -140,38 +251,55 @@ function ParamForm({
 }
 
 // ---------------------------------------------------------------------------
-// CommandCard — single command in browse view
+// Command card
 // ---------------------------------------------------------------------------
 
 function CommandCard({
   cmd,
   sessionId,
+  onRun,
 }: {
   cmd: ReconCommand;
   sessionId: string | null;
+  onRun: (cmd: ReconCommand, params: Record<string, string>) => Promise<ReconRunResult>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [params, setParams] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
-  const [ran, setRan] = useState(false);
+  const [success, setSuccess] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  const preview = cmd.buildCommand(
-    Object.fromEntries(
-      cmd.params.map((p) => [p.name, params[p.name] ?? p.placeholder])
-    )
-  );
+  const preview = cmd.buildCommand(buildPreviewParams(cmd, params));
 
   async function handleRun() {
     setError(null);
-    const err = validateParams(cmd, params);
-    if (err) { setError(err); return; }
-    if (!sessionId) { setError("No active terminal session. Open the Recon workspace first."); return; }
+    setSuccess(null);
+
+    const prepared = applyParamDefaults(cmd, params);
+    const err = validateParams(cmd, prepared);
+    if (err) {
+      setError(err);
+      return;
+    }
+    if (!sessionId) {
+      setError("No active terminal session. Open the Recon workspace first.");
+      return;
+    }
+
+    setBusy(true);
     try {
-      await sendCommandToTerminal(sessionId, cmd.buildCommand(params));
-      setRan(true);
-      setTimeout(() => setRan(false), 3000);
-    } catch (e) {
-      setError(String(e));
+      const result = await onRun(cmd, prepared);
+      const savedCount = result.persistedReconCount + result.persistedScopeTargetCount;
+      const savedLabel = savedCount === 1 ? "1 parsed result" : `${savedCount} parsed results`;
+      setSuccess(
+        result.exitCode === 0
+          ? `Completed and saved ${savedLabel}.`
+          : `Exited ${result.exitCode}; processed ${savedLabel}.`
+      );
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -185,17 +313,19 @@ function CommandCard({
       )}
     >
       <button
-        onClick={() => setExpanded((v) => !v)}
+        onClick={() => setExpanded((value) => !value)}
         className="flex w-full items-start gap-3 px-3 py-2.5 text-left"
       >
-        <div className="flex-1 min-w-0">
+        <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className="text-xs font-medium text-gray-200">{cmd.name}</span>
             <span className="rounded bg-surface-700 px-1.5 py-0.5 font-mono text-[10px] text-gray-500">
               {cmd.skill}
             </span>
           </div>
-          <p className="mt-0.5 text-[11px] text-gray-500 line-clamp-2">{cmd.description}</p>
+          <p className="mt-0.5 line-clamp-2 text-[11px] text-gray-500">
+            {cmd.description}
+          </p>
         </div>
         <ChevronRight
           size={13}
@@ -207,16 +337,20 @@ function CommandCard({
       </button>
 
       {expanded && (
-        <div className="border-t border-surface-700 px-3 py-3 space-y-3">
+        <div className="space-y-3 border-t border-surface-700 px-3 py-3">
           <ParamForm
             cmd={cmd}
             values={params}
-            onChange={(n, v) => setParams((prev) => ({ ...prev, [n]: v }))}
+            onChange={(name, value) =>
+              setParams((previous) => ({ ...previous, [name]: value }))
+            }
+            disabled={busy}
           />
 
-          {/* Command preview */}
           <div className="flex items-center gap-1.5 rounded bg-surface-950 px-2 py-1.5">
-            <span className="font-mono text-[10px] text-gray-400 flex-1 truncate">{preview}</span>
+            <span className="flex-1 truncate font-mono text-[10px] text-gray-400">
+              {preview}
+            </span>
             <button
               onClick={() => navigator.clipboard.writeText(preview).catch(() => {})}
               className="shrink-0 text-gray-600 hover:text-gray-300"
@@ -227,19 +361,26 @@ function CommandCard({
           </div>
 
           {error && <p className="text-[11px] text-red-400">{error}</p>}
+          {success && <p className="text-[11px] text-accent-green">{success}</p>}
 
           <button
             onClick={handleRun}
-            disabled={!sessionId}
+            disabled={!sessionId || busy}
             className={clsx(
               "flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-40",
-              ran
+              success && !busy
                 ? "bg-accent-green/20 text-accent-green"
                 : "bg-accent-red text-white hover:bg-red-700"
             )}
           >
-            {ran ? <CheckCircle size={12} /> : <Play size={12} />}
-            {ran ? "Sent to terminal" : "Run"}
+            {busy ? (
+              <LoaderCircle size={12} className="animate-spin" />
+            ) : success ? (
+              <CheckCircle size={12} />
+            ) : (
+              <Play size={12} />
+            )}
+            {busy ? "Running…" : success ? "Run Again" : "Run"}
           </button>
         </div>
       )}
@@ -251,34 +392,64 @@ function CommandCard({
 // Quick Recon view
 // ---------------------------------------------------------------------------
 
-function QuickReconView({ sessionId }: { sessionId: string | null }) {
-  const quickCmds = RECON_COMMANDS.filter((c) => QUICK_RECON_IDS.includes(c.id));
-  const [sharedParams, setSharedParams] = useState<Record<string, string>>({});
+function QuickReconView({
+  sessionId,
+  initialParams,
+  onRun,
+}: {
+  sessionId: string | null;
+  initialParams: Record<string, string>;
+  onRun: (cmd: ReconCommand, params: Record<string, string>) => Promise<ReconRunResult>;
+}) {
+  const quickCmds = RECON_COMMANDS.filter((cmd) => QUICK_RECON_IDS.includes(cmd.id));
+  const [sharedParams, setSharedParams] = useState<Record<string, string>>(initialParams);
   const [error, setError] = useState<string | null>(null);
   const [queue, setQueue] = useState<string[]>([]);
   const [sent, setSent] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
 
   function toggleQueue(id: string) {
-    setQueue((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    setQueue((previous) =>
+      previous.includes(id)
+        ? previous.filter((value) => value !== id)
+        : [...previous, id]
     );
   }
 
   async function runAll() {
     setError(null);
-    if (!sessionId) { setError("No active terminal session."); return; }
-    const toRun = queue.length > 0 ? quickCmds.filter((c) => queue.includes(c.id)) : quickCmds;
+    setSent([]);
 
-    for (const cmd of toRun) {
-      const err = validateParams(cmd, sharedParams);
-      if (err) { setError(`${cmd.name}: ${err}`); return; }
+    if (!sessionId) {
+      setError("No active terminal session.");
+      return;
     }
 
-    for (const cmd of toRun) {
-      await sendCommandToTerminal(sessionId, cmd.buildCommand(sharedParams));
-      setSent((prev) => [...prev, cmd.id]);
-      // small delay so the terminal can process each command
-      await new Promise((r) => setTimeout(r, 500));
+    const toRun =
+      queue.length > 0
+        ? quickCmds.filter((command) => queue.includes(command.id))
+        : quickCmds;
+
+    for (const command of toRun) {
+      const prepared = applyParamDefaults(command, sharedParams);
+      const err = validateParams(command, prepared);
+      if (err) {
+        setError(`${command.name}: ${err}`);
+        return;
+      }
+    }
+
+    setBusy(true);
+    try {
+      for (const command of toRun) {
+        const prepared = applyParamDefaults(command, sharedParams);
+        await onRun(command, prepared);
+        setSent((previous) => [...previous, command.id]);
+      }
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -286,15 +457,17 @@ function QuickReconView({ sessionId }: { sessionId: string | null }) {
     <div className="space-y-4">
       <p className="text-xs text-gray-500">
         Fill in the target and click <strong className="text-gray-300">Run All</strong> to execute
-        the most common starting recon commands in sequence. Tick individual commands to run a
-        subset only.
+        the most common starting recon commands in sequence. Parsed results are
+        saved after each step.
       </p>
 
-      {/* Shared param inputs (domain + url cover most quick commands) */}
       <div className="grid grid-cols-2 gap-3">
         {["domain", "url", "company_name", "org_name"].map((key) => {
-          const needsKey = quickCmds.some((c) => c.params.some((p) => p.name === key));
+          const needsKey = quickCmds.some((command) =>
+            command.params.some((param) => param.name === key)
+          );
           if (!needsKey) return null;
+
           const labels: Record<string, string> = {
             domain: "Target Domain",
             url: "Target URL",
@@ -307,43 +480,59 @@ function QuickReconView({ sessionId }: { sessionId: string | null }) {
             company_name: "Acme Corp",
             org_name: "acmecorp",
           };
+
           return (
             <div key={key} className="flex flex-col gap-1">
-              <label className="text-[11px] font-medium text-gray-400">{labels[key]}</label>
+              <label className="text-[11px] font-medium text-gray-400">
+                {labels[key]}
+              </label>
               <input
                 type="text"
                 value={sharedParams[key] ?? ""}
-                onChange={(e) => setSharedParams((p) => ({ ...p, [key]: e.target.value }))}
+                onChange={(event) =>
+                  setSharedParams((previous) => ({
+                    ...previous,
+                    [key]: event.target.value,
+                  }))
+                }
                 placeholder={placeholders[key]}
-                className="rounded border border-surface-600 bg-surface-800 px-2 py-1.5 font-mono text-xs text-gray-200 outline-none focus:border-accent-red/50"
+                disabled={busy}
+                className="rounded border border-surface-600 bg-surface-800 px-2 py-1.5 font-mono text-xs text-gray-200 outline-none focus:border-accent-red/50 disabled:opacity-50"
               />
             </div>
           );
         })}
       </div>
 
-      {/* Command checklist */}
       <div className="space-y-1.5">
-        {quickCmds.map((cmd) => {
-          const isQueued = queue.length === 0 || queue.includes(cmd.id);
-          const isSent = sent.includes(cmd.id);
+        {quickCmds.map((command) => {
+          const isQueued = queue.length === 0 || queue.includes(command.id);
+          const isSent = sent.includes(command.id);
           return (
             <label
-              key={cmd.id}
+              key={command.id}
               className="flex cursor-pointer items-start gap-2.5 rounded border border-surface-700 px-3 py-2 hover:border-surface-600"
             >
               <input
                 type="checkbox"
                 checked={isQueued}
-                onChange={() => toggleQueue(cmd.id)}
+                onChange={() => toggleQueue(command.id)}
+                disabled={busy}
                 className="mt-0.5 accent-accent-red"
               />
-              <div className="flex-1 min-w-0">
-                <span className={clsx("text-xs font-medium", isSent ? "text-accent-green" : "text-gray-200")}>
-                  {cmd.name}
-                  {isSent && <CheckCircle size={11} className="ml-1.5 inline text-accent-green" />}
+              <div className="min-w-0 flex-1">
+                <span
+                  className={clsx(
+                    "text-xs font-medium",
+                    isSent ? "text-accent-green" : "text-gray-200"
+                  )}
+                >
+                  {command.name}
+                  {isSent && (
+                    <CheckCircle size={11} className="ml-1.5 inline text-accent-green" />
+                  )}
                 </span>
-                <p className="text-[11px] text-gray-600 truncate">{cmd.description}</p>
+                <p className="truncate text-[11px] text-gray-600">{command.description}</p>
               </div>
             </label>
           );
@@ -354,11 +543,11 @@ function QuickReconView({ sessionId }: { sessionId: string | null }) {
 
       <button
         onClick={runAll}
-        disabled={!sessionId}
+        disabled={!sessionId || busy}
         className="flex items-center gap-1.5 rounded bg-accent-red px-4 py-2 text-xs font-semibold text-white disabled:opacity-40 hover:bg-red-700"
       >
-        <Zap size={13} />
-        Run All Discovery
+        {busy ? <LoaderCircle size={13} className="animate-spin" /> : <Zap size={13} />}
+        {busy ? "Running…" : "Run All Discovery"}
       </button>
     </div>
   );
@@ -368,86 +557,191 @@ function QuickReconView({ sessionId }: { sessionId: string | null }) {
 // Pipeline view
 // ---------------------------------------------------------------------------
 
-function PipelineView({ sessionId }: { sessionId: string | null }) {
-  const [sharedParams, setSharedParams] = useState<Record<string, string>>({});
+function PipelineView({
+  sessionId,
+  engagementId,
+  initialParams,
+  onRun,
+}: {
+  sessionId: string | null;
+  engagementId: string;
+  initialParams: Record<string, string>;
+  onRun: (cmd: ReconCommand, params: Record<string, string>) => Promise<ReconRunResult>;
+}) {
+  const [sharedParams, setSharedParams] = useState<Record<string, string>>(initialParams);
   const [steps, setSteps] = useState<PipelineStep[]>(() =>
-    PIPELINE_COMMANDS.map((cmd) => ({ command: cmd, params: {}, status: "pending" }))
+    buildPipelineDiscoverySteps(initialParams)
   );
   const [pipelineStatus, setPipelineStatus] = useState<PipelineStatus>("idle");
-  const [currentStep, setCurrentStep] = useState(0);
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
-  const cancelRef = useRef(false);
 
-  function mergedParams(step: PipelineStep): Record<string, string> {
-    // Shared params fill in the gaps; step-specific params override.
-    return { ...sharedParams, ...step.params };
+  const stepsRef = useRef<PipelineStep[]>(steps);
+  const pauseRequestedRef = useRef(false);
+  const cancelRequestedRef = useRef(false);
+  const nextIndexRef = useRef(0);
+  const hostExpansionRef = useRef(false);
+  const loopInFlightRef = useRef(false);
+
+  function syncSteps(nextSteps: PipelineStep[]) {
+    stepsRef.current = nextSteps;
+    setSteps(nextSteps);
   }
 
   function updateStepStatus(index: number, status: PipelineStepStatus) {
-    setSteps((prev) =>
-      prev.map((s, i) => (i === index ? { ...s, status } : s))
+    syncSteps(
+      stepsRef.current.map((step, currentIndex) =>
+        currentIndex === index ? { ...step, status } : step
+      )
     );
   }
 
-  async function runPipeline() {
-    if (!sessionId) { setError("No active terminal session."); return; }
-    setError(null);
-    cancelRef.current = false;
-    setPipelineStatus("running");
+  async function maybeExpandHostSteps(seedDomain: string) {
+    if (hostExpansionRef.current) return;
+    const discovered = await getPersistedSubdomainHosts(engagementId);
+    const hosts = unique([seedDomain, ...discovered]);
+    if (hosts.length === 0) return;
 
-    // Reset
-    setSteps((prev) => prev.map((s) => ({ ...s, status: "pending" })));
-    setCurrentStep(0);
+    hostExpansionRef.current = true;
+    syncSteps([...stepsRef.current, ...buildPipelineHostSteps(hosts)]);
+  }
 
-    for (let i = 0; i < steps.length; i++) {
-      if (cancelRef.current) {
-        setPipelineStatus("cancelled");
-        return;
+  async function runLoop() {
+    if (loopInFlightRef.current) return;
+    loopInFlightRef.current = true;
+
+    try {
+      while (nextIndexRef.current < stepsRef.current.length) {
+        if (cancelRequestedRef.current) {
+          setPipelineStatus("cancelled");
+          return;
+        }
+
+        const step = stepsRef.current[nextIndexRef.current];
+        const params = applyParamDefaults(step.command, {
+          ...sharedParams,
+          ...step.params,
+        });
+
+        const missing = validateParams(step.command, params);
+        if (missing) {
+          updateStepStatus(nextIndexRef.current, "skipped");
+          nextIndexRef.current += 1;
+          continue;
+        }
+
+        setCurrentStepIndex(nextIndexRef.current);
+        updateStepStatus(nextIndexRef.current, "running");
+
+        try {
+          const result = await onRun(step.command, params);
+
+          if (result.exitCode !== 0) {
+            updateStepStatus(nextIndexRef.current, "error");
+            setError(`Step "${step.label}" exited with status ${result.exitCode}.`);
+            setPipelineStatus("paused");
+            return;
+          }
+
+          updateStepStatus(nextIndexRef.current, "done");
+
+          if (step.command.id === "dns_intelligence") {
+            await maybeExpandHostSteps(params.domain ?? "");
+          }
+        } catch (cause) {
+          updateStepStatus(nextIndexRef.current, "error");
+          setError(`Step "${step.label}" failed: ${String(cause)}`);
+          setPipelineStatus("paused");
+          return;
+        }
+
+        nextIndexRef.current += 1;
+
+        if (pauseRequestedRef.current) {
+          pauseRequestedRef.current = false;
+          setPipelineStatus("paused");
+          return;
+        }
       }
 
-      const step = steps[i];
-      const params = mergedParams(step);
+      setPipelineStatus("done");
+    } finally {
+      loopInFlightRef.current = false;
+    }
+  }
 
-      // Validate required params
-      const missingParam = step.command.params.find(
-        (p) => p.required && !params[p.name]?.trim()
-      );
-      if (missingParam) {
-        updateStepStatus(i, "skipped");
-        continue;
-      }
-
-      updateStepStatus(i, "running");
-      setCurrentStep(i);
-
-      try {
-        await sendCommandToTerminal(sessionId, step.command.buildCommand(params));
-        // Give the terminal 800 ms before moving on (enough for the
-        // write_terminal scope check to complete).
-        await new Promise((r) => setTimeout(r, 800));
-        updateStepStatus(i, "done");
-      } catch (e) {
-        updateStepStatus(i, "error");
-        setError(`Step "${step.command.name}" failed: ${String(e)}`);
-        setPipelineStatus("paused");
-        return;
-      }
+  async function startPipeline() {
+    if (!sessionId) {
+      setError("No active terminal session.");
+      return;
     }
 
-    setPipelineStatus("done");
+    const seededParams = {
+      ...sharedParams,
+      company_name: deriveCompanyName(sharedParams),
+    };
+    const discoverySteps = buildPipelineDiscoverySteps(seededParams);
+
+    setSharedParams(seededParams);
+    setError(null);
+    setCurrentStepIndex(0);
+    pauseRequestedRef.current = false;
+    cancelRequestedRef.current = false;
+    hostExpansionRef.current = false;
+    nextIndexRef.current = 0;
+    syncSteps(discoverySteps);
+    setPipelineStatus("running");
+    await runLoop();
+  }
+
+  async function resumePipeline() {
+    if (!sessionId) {
+      setError("No active terminal session.");
+      return;
+    }
+
+    setError(null);
+    cancelRequestedRef.current = false;
+    pauseRequestedRef.current = false;
+
+    const nextIndex = stepsRef.current.findIndex(
+      (step) => step.status === "pending" || step.status === "error"
+    );
+
+    if (nextIndex === -1) {
+      setPipelineStatus("done");
+      return;
+    }
+
+    nextIndexRef.current = nextIndex;
+    if (stepsRef.current[nextIndex]?.status === "error") {
+      updateStepStatus(nextIndex, "pending");
+    }
+
+    setPipelineStatus("running");
+    await runLoop();
+  }
+
+  function pausePipeline() {
+    pauseRequestedRef.current = true;
   }
 
   function cancelPipeline() {
-    cancelRef.current = true;
-    setPipelineStatus("cancelled");
+    cancelRequestedRef.current = true;
+    if (pipelineStatus !== "running") {
+      setPipelineStatus("cancelled");
+    }
   }
 
   function resetPipeline() {
-    cancelRef.current = false;
-    setPipelineStatus("idle");
-    setCurrentStep(0);
+    pauseRequestedRef.current = false;
+    cancelRequestedRef.current = false;
+    hostExpansionRef.current = false;
+    nextIndexRef.current = 0;
+    setCurrentStepIndex(0);
     setError(null);
-    setSteps((prev) => prev.map((s) => ({ ...s, status: "pending" })));
+    setPipelineStatus("idle");
+    syncSteps(buildPipelineDiscoverySteps(sharedParams));
   }
 
   const statusIcon: Record<PipelineStepStatus, React.ReactNode> = {
@@ -461,12 +755,11 @@ function PipelineView({ sessionId }: { sessionId: string | null }) {
   return (
     <div className="space-y-4">
       <p className="text-xs text-gray-500">
-        The Full Recon Pipeline runs all skill-mapped commands in order. Fill in shared target
-        values below and click <strong className="text-gray-300">Start Pipeline</strong>.
-        Each command is sent to the terminal in sequence — watch the terminal panel for output.
+        The Full Recon Pipeline runs discovery first, then fans out the host-level
+        TLS and fingerprinting steps for each discovered host. Pause and cancel
+        take effect after the current terminal command finishes.
       </p>
 
-      {/* Shared params */}
       <div className="grid grid-cols-2 gap-3">
         {[
           { name: "domain", label: "Target Domain", placeholder: "example.com" },
@@ -479,7 +772,12 @@ function PipelineView({ sessionId }: { sessionId: string | null }) {
               type="text"
               value={sharedParams[name] ?? ""}
               disabled={pipelineStatus === "running"}
-              onChange={(e) => setSharedParams((p) => ({ ...p, [name]: e.target.value }))}
+              onChange={(event) =>
+                setSharedParams((previous) => ({
+                  ...previous,
+                  [name]: event.target.value,
+                }))
+              }
               placeholder={placeholder}
               className="rounded border border-surface-600 bg-surface-800 px-2 py-1.5 font-mono text-xs text-gray-200 outline-none focus:border-accent-red/50 disabled:opacity-40"
             />
@@ -487,13 +785,12 @@ function PipelineView({ sessionId }: { sessionId: string | null }) {
         ))}
       </div>
 
-      {/* Step list */}
       <div className="space-y-1.5">
-        {steps.map((step, i) => {
-          const isCurrent = i === currentStep && pipelineStatus === "running";
+        {steps.map((step, index) => {
+          const isCurrent = index === currentStepIndex && pipelineStatus === "running";
           return (
             <div
-              key={step.command.id}
+              key={step.key}
               className={clsx(
                 "flex items-center gap-2.5 rounded border px-3 py-2 text-xs transition-colors",
                 isCurrent
@@ -504,15 +801,18 @@ function PipelineView({ sessionId }: { sessionId: string | null }) {
               )}
             >
               <span className="shrink-0">{statusIcon[step.status]}</span>
-              <span className="shrink-0 w-4 text-center text-[10px] text-gray-600">
-                {i + 1}
+              <span className="w-4 shrink-0 text-center text-[10px] text-gray-600">
+                {index + 1}
               </span>
-              <span className={clsx("flex-1 font-medium",
-                step.status === "done" ? "text-gray-400 line-through" : "text-gray-200"
-              )}>
-                {step.command.name}
+              <span
+                className={clsx(
+                  "flex-1 font-medium",
+                  step.status === "done" ? "text-gray-400 line-through" : "text-gray-200"
+                )}
+              >
+                {step.label}
               </span>
-              <span className="font-mono text-[10px] text-gray-600 truncate max-w-[120px]">
+              <span className="max-w-[140px] truncate font-mono text-[10px] text-gray-600">
                 {step.command.skill}
               </span>
             </div>
@@ -522,45 +822,57 @@ function PipelineView({ sessionId }: { sessionId: string | null }) {
 
       {error && <p className="text-xs text-red-400">{error}</p>}
 
-      {/* Controls */}
       <div className="flex gap-2">
-        {pipelineStatus === "idle" || pipelineStatus === "cancelled" ? (
+        {(pipelineStatus === "idle" || pipelineStatus === "cancelled" || pipelineStatus === "done") && (
           <button
-            onClick={runPipeline}
+            onClick={startPipeline}
             disabled={!sessionId}
             className="flex items-center gap-1.5 rounded bg-accent-red px-4 py-2 text-xs font-semibold text-white disabled:opacity-40 hover:bg-red-700"
           >
             <Play size={13} />
-            {pipelineStatus === "cancelled" ? "Restart Pipeline" : "Start Pipeline"}
+            {pipelineStatus === "idle" ? "Start Pipeline" : "Restart Pipeline"}
           </button>
-        ) : pipelineStatus === "running" ? (
-          <button
-            onClick={cancelPipeline}
-            className="flex items-center gap-1.5 rounded border border-red-700/50 px-4 py-2 text-xs font-semibold text-red-400 hover:bg-red-900/20"
-          >
-            <Square size={13} />
-            Cancel
-          </button>
-        ) : pipelineStatus === "paused" ? (
+        )}
+
+        {pipelineStatus === "running" && (
           <>
             <button
-              onClick={runPipeline}
-              className="flex items-center gap-1.5 rounded bg-accent-red px-4 py-2 text-xs font-semibold text-white hover:bg-red-700"
+              onClick={pausePipeline}
+              className="flex items-center gap-1.5 rounded border border-surface-600 px-4 py-2 text-xs font-semibold text-gray-300 hover:bg-surface-700"
             >
               <Pause size={13} />
-              Resume
+              Pause
             </button>
             <button
               onClick={cancelPipeline}
-              className="flex items-center gap-1.5 rounded border border-surface-600 px-3 py-2 text-xs text-gray-400 hover:bg-surface-700"
+              className="flex items-center gap-1.5 rounded border border-red-700/50 px-4 py-2 text-xs font-semibold text-red-400 hover:bg-red-900/20"
             >
               <Square size={13} />
               Cancel
             </button>
           </>
-        ) : null}
+        )}
 
-        {(pipelineStatus === "done" || pipelineStatus === "cancelled") && (
+        {pipelineStatus === "paused" && (
+          <>
+            <button
+              onClick={resumePipeline}
+              className="flex items-center gap-1.5 rounded bg-accent-red px-4 py-2 text-xs font-semibold text-white hover:bg-red-700"
+            >
+              <Play size={13} />
+              Resume
+            </button>
+            <button
+              onClick={cancelPipeline}
+              className="flex items-center gap-1.5 rounded border border-red-700/50 px-4 py-2 text-xs font-semibold text-red-400 hover:bg-red-900/20"
+            >
+              <Square size={13} />
+              Cancel
+            </button>
+          </>
+        )}
+
+        {(pipelineStatus === "done" || pipelineStatus === "cancelled" || pipelineStatus === "paused") && (
           <button
             onClick={resetPipeline}
             className="flex items-center gap-1.5 rounded border border-surface-600 px-3 py-2 text-xs text-gray-400 hover:bg-surface-700"
@@ -582,39 +894,78 @@ function PipelineView({ sessionId }: { sessionId: string | null }) {
 }
 
 // ---------------------------------------------------------------------------
-// Main ReconLauncher
+// Main launcher
 // ---------------------------------------------------------------------------
 
 interface ReconLauncherProps {
-  /** Initial mode when the launcher opens. */
   initialMode?: LauncherMode;
+  initialTargetValue?: string | null;
   onClose: () => void;
 }
 
-export default function ReconLauncher({ initialMode = "browse", onClose }: ReconLauncherProps) {
-  const activeSessionId = useTerminalStore((s) => s.activeSessionId);
-
+export default function ReconLauncher({
+  initialMode = "browse",
+  initialTargetValue = null,
+  onClose,
+}: ReconLauncherProps) {
+  const queryClient = useQueryClient();
+  const activeSessionId = useTerminalStore((state) => state.activeSessionId);
+  const engagementId = useEngagementStore((state) => state.currentEngagement?.id ?? "");
   const [mode, setMode] = useState<LauncherMode>(initialMode);
-  const [activeCategory, setActiveCategory] = useState<ReconCategory>("Subdomain Discovery");
+  const [activeCategory, setActiveCategory] = useState<ReconCategory>(
+    "Subdomain Discovery"
+  );
   const [search, setSearch] = useState("");
 
-  const filteredCommands = RECON_COMMANDS.filter((c) => {
-    if (c.category !== activeCategory) return false;
+  const initialParams = useMemo(
+    () => deriveSeedParams(initialTargetValue),
+    [initialTargetValue]
+  );
+
+  const filteredCommands = RECON_COMMANDS.filter((command) => {
+    if (command.category !== activeCategory) return false;
     if (!search) return true;
-    const q = search.toLowerCase();
+    const query = search.toLowerCase();
     return (
-      c.name.toLowerCase().includes(q) ||
-      c.description.toLowerCase().includes(q) ||
-      c.skill.toLowerCase().includes(q)
+      command.name.toLowerCase().includes(query) ||
+      command.description.toLowerCase().includes(query) ||
+      command.skill.toLowerCase().includes(query)
     );
   });
 
   const noSession = !activeSessionId;
 
+  async function runCommand(
+    command: ReconCommand,
+    params: Record<string, string>
+  ): Promise<ReconRunResult> {
+    if (!activeSessionId) {
+      throw new Error("No active terminal session. Open the Recon workspace first.");
+    }
+    if (!engagementId) {
+      throw new Error("No active engagement selected.");
+    }
+
+    const result = await executeAndPersistReconCommand({
+      engagementId,
+      sessionId: activeSessionId,
+      command,
+      params,
+    });
+
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ["scope_targets", engagementId] }),
+      queryClient.invalidateQueries({ queryKey: ["recon_summary", engagementId] }),
+      queryClient.invalidateQueries({ queryKey: ["recon_data", engagementId] }),
+      queryClient.invalidateQueries({ queryKey: ["recon_data_counts", engagementId] }),
+    ]);
+
+    return result;
+  }
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
       <div className="flex h-[80vh] w-[860px] max-w-[95vw] flex-col rounded border border-surface-600 bg-surface-900 shadow-2xl">
-        {/* Header */}
         <div className="flex h-10 shrink-0 items-center gap-3 border-b border-surface-700 px-4">
           <span className="text-sm font-semibold text-gray-100">Recon Launcher</span>
           {noSession && (
@@ -624,8 +975,7 @@ export default function ReconLauncher({ initialMode = "browse", onClose }: Recon
           )}
           <div className="flex-1" />
 
-          {/* Mode tabs */}
-          {(["browse", "quickRecon", "pipeline"] as LauncherMode[]).map((m) => {
+          {(["browse", "quickRecon", "pipeline"] as LauncherMode[]).map((value) => {
             const labels: Record<LauncherMode, string> = {
               browse: "Browse",
               quickRecon: "Quick Recon",
@@ -633,16 +983,16 @@ export default function ReconLauncher({ initialMode = "browse", onClose }: Recon
             };
             return (
               <button
-                key={m}
-                onClick={() => setMode(m)}
+                key={value}
+                onClick={() => setMode(value)}
                 className={clsx(
                   "rounded px-3 py-1 text-xs font-medium transition-colors",
-                  mode === m
+                  mode === value
                     ? "bg-accent-red text-white"
                     : "text-gray-400 hover:text-gray-200"
                 )}
               >
-                {labels[m]}
+                {labels[value]}
               </button>
             );
           })}
@@ -652,52 +1002,60 @@ export default function ReconLauncher({ initialMode = "browse", onClose }: Recon
           </button>
         </div>
 
-        {/* Body */}
         <div className="flex min-h-0 flex-1">
           {mode === "browse" && (
             <>
-              {/* Category sidebar */}
               <aside className="flex w-44 shrink-0 flex-col border-r border-surface-700 bg-surface-900 py-2">
-                {RECON_CATEGORIES.map((cat) => {
-                  const Icon = CATEGORY_ICONS[cat];
-                  const count = RECON_COMMANDS.filter((c) => c.category === cat).length;
+                {RECON_CATEGORIES.map((category) => {
+                  const Icon = CATEGORY_ICONS[category];
+                  const count = RECON_COMMANDS.filter(
+                    (command) => command.category === category
+                  ).length;
                   return (
                     <button
-                      key={cat}
-                      onClick={() => { setActiveCategory(cat); setSearch(""); }}
+                      key={category}
+                      onClick={() => {
+                        setActiveCategory(category);
+                        setSearch("");
+                      }}
                       className={clsx(
                         "flex items-center gap-2 px-3 py-2 text-left text-xs transition-colors",
-                        activeCategory === cat
+                        activeCategory === category
                           ? "bg-accent-red/10 text-accent-red"
                           : "text-gray-400 hover:bg-surface-700 hover:text-gray-200"
                       )}
                     >
                       <Icon size={13} />
-                      <span className="flex-1">{cat}</span>
+                      <span className="flex-1">{category}</span>
                       <span className="text-[10px] text-gray-600">{count}</span>
                     </button>
                   );
                 })}
               </aside>
 
-              {/* Command list */}
               <div className="flex min-w-0 flex-1 flex-col">
-                {/* Search */}
                 <div className="border-b border-surface-700 p-3">
                   <input
                     value={search}
-                    onChange={(e) => setSearch(e.target.value)}
+                    onChange={(event) => setSearch(event.target.value)}
                     placeholder="Search commands…"
                     className="w-full rounded border border-surface-600 bg-surface-800 px-3 py-1.5 text-xs text-gray-200 outline-none focus:border-accent-red/50"
                   />
                 </div>
 
-                <div className="flex-1 overflow-y-auto p-3 space-y-2">
+                <div className="flex-1 space-y-2 overflow-y-auto p-3">
                   {filteredCommands.length === 0 && (
-                    <p className="py-8 text-center text-xs text-gray-600">No commands match.</p>
+                    <p className="py-8 text-center text-xs text-gray-600">
+                      No commands match.
+                    </p>
                   )}
-                  {filteredCommands.map((cmd) => (
-                    <CommandCard key={cmd.id} cmd={cmd} sessionId={activeSessionId} />
+                  {filteredCommands.map((command) => (
+                    <CommandCard
+                      key={command.id}
+                      cmd={command}
+                      sessionId={activeSessionId}
+                      onRun={runCommand}
+                    />
                   ))}
                 </div>
               </div>
@@ -706,13 +1064,22 @@ export default function ReconLauncher({ initialMode = "browse", onClose }: Recon
 
           {mode === "quickRecon" && (
             <div className="flex-1 overflow-y-auto p-5">
-              <QuickReconView sessionId={activeSessionId} />
+              <QuickReconView
+                sessionId={activeSessionId}
+                initialParams={initialParams}
+                onRun={runCommand}
+              />
             </div>
           )}
 
           {mode === "pipeline" && (
             <div className="flex-1 overflow-y-auto p-5">
-              <PipelineView sessionId={activeSessionId} />
+              <PipelineView
+                sessionId={activeSessionId}
+                engagementId={engagementId}
+                initialParams={initialParams}
+                onRun={runCommand}
+              />
             </div>
           )}
         </div>

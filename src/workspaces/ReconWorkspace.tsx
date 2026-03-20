@@ -745,6 +745,9 @@ export default function ReconWorkspace() {
     if (e.target_id) targetCounts[e.target_id] = (targetCounts[e.target_id] ?? 0) + 1;
   });
 
+  const selectedTargetValue =
+    (scopeTargetsQ.data ?? []).find((target) => target.id === selectedTarget)?.value ?? null;
+
   // ---------------------------------------------------------------------------
   // Panel resize handlers
   // ---------------------------------------------------------------------------
@@ -1167,6 +1170,7 @@ export default function ReconWorkspace() {
       {launcherMode !== null && (
         <ReconLauncher
           initialMode={launcherMode}
+          initialTargetValue={selectedTargetValue}
           onClose={() => setLauncherMode(null)}
         />
       )}

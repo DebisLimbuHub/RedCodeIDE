@@ -963,6 +963,20 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_launcher_commands_still_extract_targets_for_scope_checks() {
+        let db = setup_db();
+        insert_scope_target(&db, "eng-1", "domain", "example.com", true);
+
+        let wrapped = "( printf $'\\x1eREDCODE_RECON_START_run123\\x1f\\n' ; \
+            claude -p \"/web-application-mapping https://app.example.com\" ; \
+            status=$? ; \
+            printf $'\\n\\x1eREDCODE_RECON_END_run123:%s\\x1f\\n' \"$status\" )";
+
+        let result = check(&db, "eng-1", wrapped);
+        assert!(matches!(result, ScopeCheckResult::InScope));
+    }
+
+    #[test]
     fn command_log_rows_are_written_with_expected_scope_result() {
         let db = setup_db();
 
