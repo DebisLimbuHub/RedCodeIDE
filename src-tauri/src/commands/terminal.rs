@@ -24,6 +24,8 @@ struct PtySession {
     _child: Box<dyn portable_pty::Child + Send + Sync>,
     /// Accumulates the current input line between keystrokes.
     line_buffer: String,
+    /// Tracks whether we're currently inside an ANSI escape sequence.
+    input_state: InputParseState,
     /// Engagement to scope-check against; None means no active engagement.
     engagement_id: Option<String>,
 }
@@ -62,29 +64,72 @@ pub struct ScopeWarningPayload {
     pub result: ScopeCheckResult,
 }
 
+fn should_block_scope_result(result: &ScopeCheckResult) -> bool {
+    matches!(
+        result,
+        ScopeCheckResult::OutOfScope { .. } | ScopeCheckResult::PartiallyInScope { .. }
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+enum InputParseState {
+    #[default]
+    Normal,
+    Escape,
+    Csi,
+}
+
 // ---------------------------------------------------------------------------
 // Line-buffer helpers
 // ---------------------------------------------------------------------------
 
 /// Update the tracked line buffer for a single incoming byte.
-/// Mirrors the terminal control codes that bash/zsh readline honour.
-fn update_line_buffer(buf: &mut String, byte: u8) {
+/// Mirrors the terminal control codes that bash/zsh readline honour while
+/// ignoring ANSI escape sequences such as bracketed paste wrappers.
+fn update_line_buffer(buf: &mut String, state: &mut InputParseState, byte: u8) {
+    match state {
+        InputParseState::Escape => {
+            *state = if byte == b'[' {
+                InputParseState::Csi
+            } else {
+                InputParseState::Normal
+            };
+            return;
+        }
+        InputParseState::Csi => {
+            if (0x40..=0x7e).contains(&byte) {
+                *state = InputParseState::Normal;
+            }
+            return;
+        }
+        InputParseState::Normal => {}
+    }
+
     match byte {
         // DEL / Backspace — remove last character
-        0x7f | 0x08 => { buf.pop(); }
+        0x7f | 0x08 => {
+            buf.pop();
+        }
         // Ctrl+C / Ctrl+U — kill line
-        0x03 | 0x15 => { buf.clear(); }
+        0x03 | 0x15 => {
+            buf.clear();
+        }
         // Ctrl+W — kill last word
         0x17 => {
             let s = std::mem::take(buf);
             let without_space = s.trim_end_matches(|c: char| c == ' ');
-            let without_word  = without_space.trim_end_matches(|c: char| c != ' ');
+            let without_word = without_space.trim_end_matches(|c: char| c != ' ');
             *buf = without_word.to_string();
         }
-        // ESC — start of an escape sequence we can't parse; reset buffer
-        0x1b => { buf.clear(); }
+        // ESC — begin an ANSI escape sequence. Ignore the sequence itself,
+        // but keep the existing command buffer intact.
+        0x1b => {
+            *state = InputParseState::Escape;
+        }
         // Printable ASCII
-        0x20..=0x7e => { buf.push(byte as char); }
+        0x20..=0x7e => {
+            buf.push(byte as char);
+        }
         // Everything else (control chars, high bytes) — pass to PTY but don't
         // touch the buffer.
         _ => {}
@@ -107,7 +152,12 @@ pub fn create_terminal(
 
     let pty_system = NativePtySystem::default();
     let portable_pty::PtyPair { master, slave } = pty_system
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| e.to_string())?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
@@ -122,17 +172,21 @@ pub fn create_terminal(
 
     {
         let mut sessions = state.0.lock().unwrap();
-        sessions.insert(id.clone(), PtySession {
-            writer,
-            master,
-            _child: child,
-            line_buffer: String::new(),
-            engagement_id: None,
-        });
+        sessions.insert(
+            id.clone(),
+            PtySession {
+                writer,
+                master,
+                _child: child,
+                line_buffer: String::new(),
+                input_state: InputParseState::Normal,
+                engagement_id: None,
+            },
+        );
     }
 
     // Background thread: PTY stdout → Tauri events → xterm.js
-    let id_clone  = id.clone();
+    let id_clone = id.clone();
     let app_clone = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -140,10 +194,13 @@ pub fn create_terminal(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let _ = app_clone.emit("terminal-data", TerminalDataPayload {
-                        id: id_clone.clone(),
-                        data: buf[..n].to_vec(),
-                    });
+                    let _ = app_clone.emit(
+                        "terminal-data",
+                        TerminalDataPayload {
+                            id: id_clone.clone(),
+                            data: buf[..n].to_vec(),
+                        },
+                    );
                 }
             }
         }
@@ -165,7 +222,6 @@ pub fn set_terminal_engagement(
     let session = sessions
         .get_mut(&id)
         .ok_or_else(|| format!("terminal session '{id}' not found"))?;
-    eprintln!("[terminal] set_terminal_engagement session={id:?} engagement={engagement_id:?}");
     session.engagement_id = engagement_id;
     Ok(())
 }
@@ -204,19 +260,23 @@ pub fn write_terminal(
         if let Some(pos) = newline_pos {
             // Update buffer with pre-newline bytes and write them to PTY.
             for &byte in &data[..pos] {
-                update_line_buffer(&mut session.line_buffer, byte);
+                update_line_buffer(&mut session.line_buffer, &mut session.input_state, byte);
             }
             if pos > 0 {
-                session.writer.write_all(&data[..pos]).map_err(|e| e.to_string())?;
+                session
+                    .writer
+                    .write_all(&data[..pos])
+                    .map_err(|e| e.to_string())?;
                 session.writer.flush().map_err(|e| e.to_string())?;
             }
-            let command     = std::mem::take(&mut session.line_buffer);
-            let engagement  = session.engagement_id.clone();
+            let command = std::mem::take(&mut session.line_buffer);
+            session.input_state = InputParseState::Normal;
+            let engagement = session.engagement_id.clone();
             Some((command.trim().to_string(), engagement, pos))
         } else {
             // No newline — just track the buffer and write everything.
             for &byte in &data {
-                update_line_buffer(&mut session.line_buffer, byte);
+                update_line_buffer(&mut session.line_buffer, &mut session.input_state, byte);
             }
             session.writer.write_all(&data).map_err(|e| e.to_string())?;
             session.writer.flush().map_err(|e| e.to_string())?;
@@ -228,9 +288,11 @@ pub fn write_terminal(
     if let Some((command, engagement_id, pos)) = scope_work {
         // Only scope-check non-empty commands that target a network resource.
         let targets = extract_targets_from_command(&command);
-        let needs_check = !command.is_empty()
-            && !targets.is_empty()
-            && engagement_id.is_some();
+        let needs_check = !command.is_empty() && !targets.is_empty() && engagement_id.is_some();
+        eprintln!(
+            "[write_terminal] newline | cmd={:?} | engagement={:?} | targets={:?} | needs_check={}",
+            command, engagement_id, targets, needs_check
+        );
 
         if needs_check {
             let eid = engagement_id.unwrap();
@@ -238,15 +300,19 @@ pub fn write_terminal(
                 let db_conn = db.0.lock().map_err(|e| e.to_string())?;
                 check_scope_with_conn(&db_conn, &eid, &command)?
             };
+            eprintln!("[write_terminal] scope result: {:?}", result);
 
-            if !matches!(result, ScopeCheckResult::InScope) {
+            if should_block_scope_result(&result) {
                 // Block: emit warning, do NOT send \r to the PTY.
-                eprintln!("[terminal] scope blocked: cmd={command:?} result={result:?}");
-                app.emit("scope-warning", ScopeWarningPayload {
-                    session_id: id,
-                    command,
-                    result,
-                }).map_err(|e| e.to_string())?;
+                app.emit(
+                    "scope-warning",
+                    ScopeWarningPayload {
+                        session_id: id,
+                        command,
+                        result,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
                 return Ok(());
             }
         }
@@ -254,7 +320,10 @@ pub fn write_terminal(
         // Safe or no check needed — write \r (and any trailing bytes) to PTY.
         let mut sessions = state.0.lock().map_err(|e| e.to_string())?;
         if let Some(session) = sessions.get_mut(&id) {
-            session.writer.write_all(&data[pos..]).map_err(|e| e.to_string())?;
+            session
+                .writer
+                .write_all(&data[pos..])
+                .map_err(|e| e.to_string())?;
             session.writer.flush().map_err(|e| e.to_string())?;
         }
     }
@@ -280,13 +349,19 @@ pub fn force_execute(
         .get_mut(&id)
         .ok_or_else(|| format!("terminal session '{id}' not found"))?;
 
+    session.line_buffer.clear();
+    session.input_state = InputParseState::Normal;
+
     // Ctrl+U kills the current line in the shell, then we write command + Enter.
     let mut payload = Vec::with_capacity(command.len() + 2);
     payload.push(0x15); // Ctrl+U
     payload.extend_from_slice(command.as_bytes());
     payload.push(b'\r');
 
-    session.writer.write_all(&payload).map_err(|e| e.to_string())?;
+    session
+        .writer
+        .write_all(&payload)
+        .map_err(|e| e.to_string())?;
     session.writer.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -303,8 +378,14 @@ pub fn resize_terminal(
     let session = sessions
         .get(&id)
         .ok_or_else(|| format!("terminal session '{id}' not found"))?;
-    session.master
-        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+    session
+        .master
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -313,4 +394,38 @@ pub fn resize_terminal(
 pub fn close_terminal(state: State<'_, TerminalState>, id: String) -> Result<(), String> {
     state.0.lock().unwrap().remove(&id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scope::ScopeCheckResult;
+
+    #[test]
+    fn bracketed_paste_sequences_do_not_pollute_line_buffer() {
+        let mut buf = String::new();
+        let mut state = InputParseState::Normal;
+
+        for &byte in b"\x1b[200~nmap 10.10.10.1\x1b[201~" {
+            update_line_buffer(&mut buf, &mut state, byte);
+        }
+
+        assert_eq!(buf, "nmap 10.10.10.1");
+        assert!(matches!(state, InputParseState::Normal));
+    }
+
+    #[test]
+    fn unknown_scope_results_do_not_take_the_blocking_path() {
+        assert!(!should_block_scope_result(&ScopeCheckResult::InScope));
+        assert!(!should_block_scope_result(&ScopeCheckResult::Unknown {
+            message: "No reliable target extraction".into(),
+        }));
+        assert!(should_block_scope_result(&ScopeCheckResult::OutOfScope {
+            reason: "Explicitly excluded".into(),
+        }));
+        assert!(should_block_scope_result(&ScopeCheckResult::PartiallyInScope {
+            in_scope: vec!["10.10.10.10".into()],
+            out_of_scope: vec!["8.8.8.8".into()],
+        }));
+    }
 }

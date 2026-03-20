@@ -6,6 +6,19 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AlertTriangle, ShieldOff, ShieldCheck, AlertCircle, X } from "lucide-react";
 import { clsx } from "clsx";
 import { useEngagementStore } from "../stores/engagementStore";
+import { useScopeCheck } from "../hooks/useScopeCheck";
+import {
+  getScopeGuardrailPrimaryLabel,
+  createSerialTaskQueue,
+  isBlockingScopeResult,
+  isScopeGuardrailCancelKey,
+  isIndicatorScopeResult,
+  resetTrackedCommand,
+  shouldSuppressGuardrailEnter,
+  updateTrackedCommand,
+  type BlockingScopeResult,
+  type TrackedCommandState,
+} from "../lib/terminalScope";
 import type { ScopeCheckResult } from "../types";
 
 // ---------------------------------------------------------------------------
@@ -25,8 +38,13 @@ interface ScopeWarningPayload {
 }
 
 interface ScopeWarning {
-  result: ScopeCheckResult;
+  result: BlockingScopeResult;
   pendingCommand: string;
+}
+
+interface ScopeIndicator {
+  result: Extract<ScopeCheckResult, { type: "Unknown" }>;
+  command: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,13 +79,7 @@ const XTERM_THEME = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function sendBytes(sessionId: string, bytes: Uint8Array) {
-  invoke("write_terminal", { id: sessionId, data: Array.from(bytes) }).catch(() => null);
-}
-
-function sendText(sessionId: string, text: string) {
-  sendBytes(sessionId, new TextEncoder().encode(text));
-}
+const textEncoder = new TextEncoder();
 
 function logCommandFire(
   engagementId: string,
@@ -97,22 +109,40 @@ function ScopeWarningBanner({
   warning,
   onExecute,
   onCancel,
+  focusRef,
 }: {
   warning: ScopeWarning;
   onExecute: () => void;
   onCancel: () => void;
+  focusRef: (node: HTMLDivElement | null) => void;
 }) {
   const { result } = warning;
   const isOut     = result.type === "OutOfScope";
   const isPartial = result.type === "PartiallyInScope";
+  const primaryLabel = getScopeGuardrailPrimaryLabel(result);
 
   return (
     <div
+      ref={focusRef}
+      tabIndex={-1}
+      role="alertdialog"
+      aria-live="assertive"
+      aria-modal="false"
+      onKeyDown={(event) => {
+        if (isScopeGuardrailCancelKey(event.key)) {
+          event.preventDefault();
+          onCancel();
+          return;
+        }
+        if (shouldSuppressGuardrailEnter(event.key, event.target === event.currentTarget)) {
+          event.preventDefault();
+        }
+      }}
       className={clsx(
-        "shrink-0 border-b px-4 py-2.5 text-sm",
+        "shrink-0 border-b px-4 py-3 text-sm shadow-lg outline-none",
         isOut
-          ? "border-accent-red/30 bg-accent-red/10 text-accent-red"
-          : "border-yellow-500/30 bg-yellow-500/10 text-yellow-400"
+          ? "border-accent-red/40 bg-accent-red/12 text-accent-red"
+          : "border-yellow-500/40 bg-yellow-500/12 text-yellow-300"
       )}
     >
       {/* Header */}
@@ -125,7 +155,7 @@ function ScopeWarningBanner({
           <AlertCircle size={14} />
         )}
         <span className="font-semibold">
-          {isOut ? "Out of Scope" : isPartial ? "Partially Out of Scope" : "Scope Unknown"}
+          {isOut ? "Out of Scope" : "Partially Out of Scope"}
         </span>
         <span className="ml-auto text-xs opacity-60">
           cmd: <code className="font-mono">{warning.pendingCommand.slice(0, 60)}</code>
@@ -136,20 +166,23 @@ function ScopeWarningBanner({
       {isOut && "reason" in result && (
         <p className="mb-2 text-xs opacity-80">{result.reason}</p>
       )}
-      {result.type === "Unknown" && "message" in result && (
-        <p className="mb-2 text-xs opacity-80">{result.message}</p>
-      )}
       {isPartial && "in_scope" in result && (
-        <div className="mb-2 flex gap-4 text-xs">
-          <span className="text-accent-green">
-            <ShieldCheck size={11} className="mr-1 inline" />
-            {result.in_scope.join(", ")}
-          </span>
-          <span className="text-accent-red">
+        <>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-yellow-200/80">
+            Blocked Targets
+          </div>
+          <div className="mb-2 text-xs text-accent-red">
             <ShieldOff size={11} className="mr-1 inline" />
             {result.out_of_scope.join(", ")}
-          </span>
-        </div>
+          </div>
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-accent-green/80">
+            Allowed Targets
+          </div>
+          <div className="mb-2 text-xs text-accent-green">
+            <ShieldCheck size={11} className="mr-1 inline" />
+            {result.in_scope.join(", ")}
+          </div>
+        </>
       )}
 
       {/* Actions */}
@@ -164,7 +197,7 @@ function ScopeWarningBanner({
           onClick={onExecute}
         >
           <ShieldOff size={11} />
-          Execute Anyway
+          {primaryLabel}
         </button>
         <button
           className="flex items-center gap-1 rounded px-3 py-1 text-xs text-gray-400 hover:bg-surface-700"
@@ -188,6 +221,10 @@ interface TerminalPanelProps {
 
 export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const guardrailRef = useRef<HTMLDivElement | null>(null);
+  const flashTimeoutRef = useRef<number | null>(null);
+  const indicatorTimeoutRef = useRef<number | null>(null);
+  const writeQueueRef = useRef(createSerialTaskQueue());
   const ctxRef = useRef<{
     term: Terminal;
     fitAddon: FitAddon;
@@ -199,11 +236,17 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
   } | null>(null);
 
   const [scopeWarning, setScopeWarning] = useState<ScopeWarning | null>(null);
+  const [scopeIndicator, setScopeIndicator] = useState<ScopeIndicator | null>(null);
+  const [borderFlash, setBorderFlash] = useState<"safe" | null>(null);
+  const commandBufferRef = useRef<TrackedCommandState>(resetTrackedCommand());
+  const scopeCheckInFlightRef = useRef(false);
+  const handleTerminalInputRef = useRef<(raw: string) => Promise<void> | void>(() => {});
 
   // Keep a ref so the teardown callback can read the latest warning without
   // being re-created on every state change.
   const scopeWarningRef = useRef(scopeWarning);
   useEffect(() => { scopeWarningRef.current = scopeWarning; }, [scopeWarning]);
+  const { checkScope, isChecking } = useScopeCheck();
 
   // Reactive engagement from the store — used to sync into the Rust session.
   const currentEngagement = useEngagementStore((s) => s.currentEngagement);
@@ -224,14 +267,66 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
   useEffect(() => {
     const ctx = ctxRef.current;
     if (!ctx) return;
-    ctx.term.options.disableStdin = !!scopeWarning;
+    ctx.term.options.disableStdin = !!scopeWarning || isChecking || scopeCheckInFlightRef.current;
+  }, [scopeWarning, isChecking]);
+
+  useEffect(() => {
+    if (!scopeWarning) return;
+    const rafId = window.requestAnimationFrame(() => {
+      guardrailRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(rafId);
   }, [scopeWarning]);
+
+  const queueTerminalText = useCallback((sessionId: string, text: string) => {
+    const bytes = textEncoder.encode(text);
+    return writeQueueRef.current.enqueue(() =>
+      invoke("write_terminal", { id: sessionId, data: Array.from(bytes) })
+        .then(() => undefined)
+        .catch(() => undefined)
+    );
+  }, []);
+
+  const flushTerminalWrites = useCallback(() => writeQueueRef.current.flush(), []);
+
+  const pulseSafeBorder = useCallback(() => {
+    if (flashTimeoutRef.current !== null) {
+      window.clearTimeout(flashTimeoutRef.current);
+    }
+    setBorderFlash("safe");
+    flashTimeoutRef.current = window.setTimeout(() => {
+      setBorderFlash(null);
+      flashTimeoutRef.current = null;
+    }, 450);
+  }, []);
+
+  const showScopeIndicator = useCallback((command: string, result: ScopeIndicator["result"]) => {
+    if (indicatorTimeoutRef.current !== null) {
+      window.clearTimeout(indicatorTimeoutRef.current);
+    }
+    setScopeIndicator({ command, result });
+    indicatorTimeoutRef.current = window.setTimeout(() => {
+      setScopeIndicator(null);
+      indicatorTimeoutRef.current = null;
+    }, 4000);
+  }, []);
+
+  const clearScopeIndicator = useCallback(() => {
+    if (indicatorTimeoutRef.current !== null) {
+      window.clearTimeout(indicatorTimeoutRef.current);
+      indicatorTimeoutRef.current = null;
+    }
+    setScopeIndicator(null);
+  }, []);
 
   // ---- Execute / cancel blocked command -----------------------------------
 
-  const executeAnyway = useCallback(() => {
+  const executeAnyway = useCallback(async () => {
     const ctx = ctxRef.current;
     if (!ctx || !scopeWarning) return;
+
+    await flushTerminalWrites();
+    clearScopeIndicator();
 
     const engagement = useEngagementStore.getState().currentEngagement;
     if (engagement) {
@@ -245,12 +340,16 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
       command: scopeWarning.pendingCommand,
     }).catch(() => null);
 
+    commandBufferRef.current = resetTrackedCommand();
     setScopeWarning(null);
-  }, [scopeWarning]);
+  }, [clearScopeIndicator, flushTerminalWrites, scopeWarning]);
 
-  const cancelPending = useCallback(() => {
+  const cancelPending = useCallback(async () => {
     const ctx = ctxRef.current;
     if (!ctx || !scopeWarning) return;
+
+    await flushTerminalWrites();
+    clearScopeIndicator();
 
     const engagement = useEngagementStore.getState().currentEngagement;
     if (engagement) {
@@ -258,9 +357,94 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
     }
 
     // Ctrl+C clears the shell's current input line.
-    sendText(ctx.sessionId, "\x03");
+    await queueTerminalText(ctx.sessionId, "\x03");
+    commandBufferRef.current = resetTrackedCommand();
     setScopeWarning(null);
-  }, [scopeWarning]);
+  }, [clearScopeIndicator, flushTerminalWrites, queueTerminalText, scopeWarning]);
+
+  const handleTerminalInput = useCallback(async (raw: string) => {
+    const ctx = ctxRef.current;
+    if (!ctx || scopeWarningRef.current || scopeCheckInFlightRef.current) return;
+
+    clearScopeIndicator();
+
+    const newlineIndex = raw.search(/[\r\n]/);
+    if (newlineIndex === -1) {
+      commandBufferRef.current = updateTrackedCommand(commandBufferRef.current, raw);
+      void queueTerminalText(ctx.sessionId, raw);
+      return;
+    }
+
+    const beforeNewline = raw.slice(0, newlineIndex);
+    if (beforeNewline) {
+      commandBufferRef.current = updateTrackedCommand(commandBufferRef.current, beforeNewline);
+      void queueTerminalText(ctx.sessionId, beforeNewline);
+    }
+
+    const command = commandBufferRef.current.value.trim();
+    commandBufferRef.current = resetTrackedCommand();
+
+    console.log(
+      "[ScopeCheck] Enter | cmd:", JSON.stringify(command),
+      "| engagement:", useEngagementStore.getState().currentEngagement?.id ?? "NONE"
+    );
+
+    if (!command) {
+      await queueTerminalText(ctx.sessionId, raw.slice(newlineIndex));
+      return;
+    }
+
+    scopeCheckInFlightRef.current = true;
+    ctx.term.options.disableStdin = true;
+    let keepLocked = false;
+
+    try {
+      const result = await checkScope(command);
+      console.log("[ScopeCheck] result:", result ? result.type : "null (no engagement)");
+      if (!result) {
+        await queueTerminalText(ctx.sessionId, raw.slice(newlineIndex));
+        return;
+      }
+
+      if (result.type === "InScope") {
+        const engagement = useEngagementStore.getState().currentEngagement;
+        if (engagement) {
+          logCommandFire(engagement.id, command, result, true);
+        }
+        pulseSafeBorder();
+        await queueTerminalText(ctx.sessionId, raw.slice(newlineIndex));
+        return;
+      }
+
+      if (isIndicatorScopeResult(result)) {
+        const engagement = useEngagementStore.getState().currentEngagement;
+        if (engagement) {
+          logCommandFire(engagement.id, command, result, true);
+        }
+        showScopeIndicator(command, result);
+        await queueTerminalText(ctx.sessionId, raw.slice(newlineIndex));
+        return;
+      }
+
+      if (isBlockingScopeResult(result)) {
+        keepLocked = true;
+        setScopeWarning({
+          result,
+          pendingCommand: command,
+        });
+      }
+    } finally {
+      scopeCheckInFlightRef.current = false;
+      const currentCtx = ctxRef.current;
+      if (currentCtx) {
+        currentCtx.term.options.disableStdin = keepLocked || !!scopeWarningRef.current;
+      }
+    }
+  }, [checkScope, clearScopeIndicator, pulseSafeBorder, queueTerminalText, showScopeIndicator]);
+
+  useEffect(() => {
+    handleTerminalInputRef.current = handleTerminalInput;
+  }, [handleTerminalInput]);
 
   // ---- Teardown -----------------------------------------------------------
 
@@ -272,6 +456,14 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
     ctx.unlistenData();
     ctx.unlistenExit();
     ctx.unlistenWarning();
+    if (flashTimeoutRef.current !== null) {
+      window.clearTimeout(flashTimeoutRef.current);
+      flashTimeoutRef.current = null;
+    }
+    if (indicatorTimeoutRef.current !== null) {
+      window.clearTimeout(indicatorTimeoutRef.current);
+      indicatorTimeoutRef.current = null;
+    }
     invoke("close_terminal", { id: ctx.sessionId }).catch(() => null);
     ctx.term.dispose();
   }, []);
@@ -337,17 +529,19 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
       // Scope-warning events emitted by write_terminal when a command is blocked.
       const unlistenWarning = await listen<ScopeWarningPayload>("scope-warning", (event) => {
         if (event.payload.session_id !== sessionId) return;
-        console.log("[ScopeCheck] Blocked:", event.payload);
+        if (!isBlockingScopeResult(event.payload.result)) return;
+        commandBufferRef.current = resetTrackedCommand();
+        clearScopeIndicator();
         setScopeWarning({
           result: event.payload.result,
           pendingCommand: event.payload.command,
         });
       });
 
-      // All keystrokes flow straight to write_terminal — scope logic is in Rust.
-      // onData is a pure byte forwarder; no interception here.
+      // Preflight scope-check on Enter before the shell sees the newline.
+      // Rust still enforces the same check at PTY level as a backup.
       term.onData((raw: string) => {
-        sendBytes(sessionId, new TextEncoder().encode(raw));
+        void handleTerminalInputRef.current(raw);
       });
 
       // Resize observer
@@ -380,7 +574,7 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
 
   // ---- Render -------------------------------------------------------------
 
-  const borderFlash =
+  const warningBorder =
     scopeWarning?.result.type === "OutOfScope"
       ? "ring-1 ring-inset ring-accent-red/40"
       : scopeWarning?.result.type === "PartiallyInScope"
@@ -395,18 +589,32 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
           warning={scopeWarning}
           onExecute={executeAnyway}
           onCancel={cancelPending}
+          focusRef={(node) => {
+            guardrailRef.current = node;
+          }}
         />
       )}
 
       {/* xterm.js container */}
       <div
-        ref={containerRef}
         className={clsx(
-          "flex-1 overflow-hidden bg-surface-950 transition-all duration-300",
-          borderFlash
+          "relative flex-1 overflow-hidden bg-surface-950 transition-all duration-300",
+          warningBorder,
+          borderFlash === "safe" && "ring-1 ring-inset ring-accent-green/50",
+          scopeIndicator && "ring-1 ring-inset ring-yellow-500/20"
         )}
-        style={{ padding: "6px 4px" }}
-      />
+      >
+        {scopeIndicator && (
+          <div className="pointer-events-none absolute right-3 top-3 z-10 rounded border border-yellow-500/30 bg-surface-900/90 px-2.5 py-1 text-[11px] text-yellow-400 shadow-lg">
+            <span className="font-semibold">Scope unknown</span>
+          </div>
+        )}
+        <div
+          ref={containerRef}
+          className="h-full w-full"
+          style={{ padding: "6px 4px" }}
+        />
+      </div>
     </div>
   );
 }

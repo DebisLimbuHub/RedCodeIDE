@@ -5,11 +5,10 @@ mod evidence;
 mod scope;
 
 use commands::{
-    archive_engagement, bulk_import_targets, close_terminal, create_engagement,
-    create_scope_rule, create_scope_target, create_terminal, delete_scope_rule,
-    delete_scope_target, force_execute, get_engagement, list_engagements, list_scope_rules,
-    list_scope_targets, resize_terminal, set_terminal_engagement, update_engagement,
-    update_scope_target, write_terminal, TerminalState,
+    archive_engagement, bulk_import_targets, close_terminal, create_engagement, create_scope_rule,
+    create_scope_target, create_terminal, delete_scope_rule, delete_scope_target, force_execute,
+    get_engagement, list_engagements, list_scope_rules, list_scope_targets, resize_terminal,
+    set_terminal_engagement, update_engagement, update_scope_target, write_terminal, TerminalState,
 };
 use db::DbState;
 use scope::{check_scope, log_command};

@@ -40,8 +40,7 @@ fn row_to_engagement(row: &rusqlite::Row) -> rusqlite::Result<Engagement> {
     })
 }
 
-const SELECT_COLS: &str =
-    "SELECT id, name, client_name, engagement_type, methodology, status, \
+const SELECT_COLS: &str = "SELECT id, name, client_name, engagement_type, methodology, status, \
      start_date, end_date, notes, created_at, updated_at \
      FROM engagements";
 
@@ -70,8 +69,15 @@ pub fn create_engagement(
               start_date, end_date, notes, created_at, updated_at) \
          VALUES (?1,?2,?3,?4,?5,'active',?6,?7,?8,?9,?9)",
         params![
-            id, name, client_name, engagement_type, methodology,
-            start_date, end_date, notes, now
+            id,
+            name,
+            client_name,
+            engagement_type,
+            methodology,
+            start_date,
+            end_date,
+            notes,
+            now
         ],
     )
     .map_err(|e| e.to_string())?;
@@ -125,7 +131,9 @@ pub fn list_engagements(
         }
         Some(filter) => {
             let mut stmt = db
-                .prepare(&format!("{SELECT_COLS} WHERE status=?1 ORDER BY updated_at DESC"))
+                .prepare(&format!(
+                    "{SELECT_COLS} WHERE status=?1 ORDER BY updated_at DESC"
+                ))
                 .map_err(|e| e.to_string())?;
             let rows: Vec<Result<Engagement, String>> = stmt
                 .query_map(params![filter], row_to_engagement)
@@ -160,8 +168,16 @@ pub fn update_engagement(
                  status=?6, start_date=?7, end_date=?8, notes=?9, updated_at=?10 \
              WHERE id=?1",
             params![
-                id, name, client_name, engagement_type, methodology,
-                status, start_date, end_date, notes, now
+                id,
+                name,
+                client_name,
+                engagement_type,
+                methodology,
+                status,
+                start_date,
+                end_date,
+                notes,
+                now
             ],
         )
         .map_err(|e| e.to_string())?;

@@ -107,8 +107,15 @@ pub fn create_scope_target(
              (id, engagement_id, target_type, value, ports, protocol, in_scope, notes, created_at) \
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![
-            id, engagement_id, target_type, value,
-            ports, protocol, in_scope_int, notes, now
+            id,
+            engagement_id,
+            target_type,
+            value,
+            ports,
+            protocol,
+            in_scope_int,
+            notes,
+            now
         ],
     )
     .map_err(|e| e.to_string())?;
