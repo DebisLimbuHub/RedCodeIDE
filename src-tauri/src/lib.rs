@@ -5,9 +5,10 @@ mod evidence;
 mod scope;
 
 use commands::{
-    archive_engagement, bulk_import_targets, close_terminal, create_engagement, create_scope_rule,
-    create_scope_target, create_terminal, delete_scope_rule, delete_scope_target, force_execute,
-    get_engagement, list_engagements, list_scope_rules, list_scope_targets, resize_terminal,
+    add_recon_data, archive_engagement, bulk_import_targets, close_terminal, create_engagement,
+    create_scope_rule, create_scope_target, create_terminal, delete_recon_data, delete_scope_rule,
+    delete_scope_target, force_execute, get_engagement, get_recon_data, get_recon_summary,
+    import_recon_data, list_engagements, list_scope_rules, list_scope_targets, resize_terminal,
     set_terminal_engagement, update_engagement, update_scope_target, write_terminal, TerminalState,
 };
 use db::DbState;
@@ -52,6 +53,12 @@ pub fn run() {
             // terminal helpers
             set_terminal_engagement,
             force_execute,
+            // recon
+            get_recon_summary,
+            get_recon_data,
+            add_recon_data,
+            import_recon_data,
+            delete_recon_data,
         ])
         .run(tauri::generate_context!())
         .expect("error while running RedCode IDE");

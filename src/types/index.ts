@@ -70,3 +70,54 @@ export interface ScopeRule {
   description: string;
   created_at: string;
 }
+
+// ---------------------------------------------------------------------------
+// Recon data
+// ---------------------------------------------------------------------------
+
+export type ReconDataType =
+  | "subdomain"
+  | "open_port"
+  | "service"
+  | "technology"
+  | "dns_record"
+  | "certificate"
+  | "whois"
+  | "email"
+  | "credential"
+  | "api_endpoint"
+  | "cloud_resource";
+
+/** Mirrors the Rust `ReconEntry` struct (snake_case). */
+export interface ReconEntry {
+  id: string;
+  engagement_id: string;
+  target_id: string | null;
+  data_type: ReconDataType;
+  /** JSON blob — parse per-tab to extract meaningful columns. */
+  value: string;
+  source: string | null;
+  confidence: number;
+  created_at: string;
+}
+
+/** Mirrors the Rust `ReconSummary` struct. */
+export interface ReconSummary {
+  total_count: number;
+  subdomains: number;
+  open_ports: number;
+  services: number;
+  technologies: number;
+  dns_records: number;
+  certificates: number;
+  api_endpoints: number;
+  other: number;
+}
+
+/** Mirrors the Rust `PaginatedReconData` struct. */
+export interface PaginatedReconData {
+  data: ReconEntry[];
+  total: number;
+  page: number;
+  per_page: number;
+}

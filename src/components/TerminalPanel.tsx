@@ -6,6 +6,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { AlertTriangle, ShieldOff, ShieldCheck, AlertCircle, X } from "lucide-react";
 import { clsx } from "clsx";
 import { useEngagementStore } from "../stores/engagementStore";
+import { useTerminalStore } from "../stores/terminalStore";
 import { useScopeCheck } from "../hooks/useScopeCheck";
 import {
   getScopeGuardrailPrimaryLabel,
@@ -464,6 +465,7 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
       window.clearTimeout(indicatorTimeoutRef.current);
       indicatorTimeoutRef.current = null;
     }
+    useTerminalStore.getState().setActiveSessionId(null);
     invoke("close_terminal", { id: ctx.sessionId }).catch(() => null);
     ctx.term.dispose();
   }, []);
@@ -505,6 +507,10 @@ export default function TerminalPanel({ className = "" }: TerminalPanelProps) {
         term.dispose();
         return;
       }
+
+      // Expose session ID so external components (e.g. ReconLauncher) can
+      // inject commands via invoke("write_terminal", ...).
+      useTerminalStore.getState().setActiveSessionId(sessionId);
 
       // Sync the current engagement into the new session immediately.
       const initialEngagement = useEngagementStore.getState().currentEngagement;

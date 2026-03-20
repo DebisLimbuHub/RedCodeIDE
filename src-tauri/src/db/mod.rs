@@ -64,4 +64,20 @@ CREATE TABLE IF NOT EXISTS command_log (
     executed        INTEGER NOT NULL DEFAULT 0,
     created_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS recon_data (
+    id              TEXT PRIMARY KEY,
+    engagement_id   TEXT NOT NULL REFERENCES engagements(id) ON DELETE CASCADE,
+    target_id       TEXT REFERENCES scope_targets(id) ON DELETE SET NULL,
+    data_type       TEXT NOT NULL,
+    value           TEXT NOT NULL,
+    source          TEXT,
+    confidence      REAL NOT NULL DEFAULT 0.5,
+    created_at      TEXT NOT NULL,
+    UNIQUE(engagement_id, data_type, value)
+);
+
+CREATE INDEX IF NOT EXISTS idx_recon_data_engagement ON recon_data(engagement_id);
+CREATE INDEX IF NOT EXISTS idx_recon_data_type ON recon_data(engagement_id, data_type);
+CREATE INDEX IF NOT EXISTS idx_recon_data_target ON recon_data(engagement_id, target_id);
 "#;
