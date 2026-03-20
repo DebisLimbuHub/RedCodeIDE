@@ -1,2 +1,5 @@
 // Scope enforcement logic
-// Validates targets against the defined engagement scope
+mod checker;
+pub use checker::{
+    check_scope, check_scope_with_conn, extract_targets_from_command, log_command, ScopeCheckResult,
+};

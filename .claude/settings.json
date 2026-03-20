@@ -36,7 +36,9 @@
       "Bash(apt-cache show:*)",
       "Bash(pkexec apt-get:*)",
       "Bash(pnpm build:*)",
-      "Bash(timeout 30 pnpm tauri dev)"
+      "Bash(timeout 30 pnpm tauri dev)",
+      "Bash(npm run:*)",
+      "Bash(npx tsc:*)"
     ]
   }
 }

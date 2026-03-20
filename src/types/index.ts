@@ -51,6 +51,17 @@ export interface ScopeTarget {
   created_at: string;
 }
 
+// ---------------------------------------------------------------------------
+// Scope enforcement
+// ---------------------------------------------------------------------------
+
+/** Discriminated union mirroring the Rust `ScopeCheckResult` enum. */
+export type ScopeCheckResult =
+  | { type: "InScope" }
+  | { type: "OutOfScope"; reason: string }
+  | { type: "Unknown"; message: string }
+  | { type: "PartiallyInScope"; in_scope: string[]; out_of_scope: string[] };
+
 /** Mirrors the Rust `ScopeRule` struct (snake_case). */
 export interface ScopeRule {
   id: string;
