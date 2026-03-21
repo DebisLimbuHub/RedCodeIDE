@@ -120,4 +120,24 @@ CREATE TABLE IF NOT EXISTS technique_log (
 CREATE INDEX IF NOT EXISTS idx_credentials_engagement ON credentials(engagement_id);
 CREATE INDEX IF NOT EXISTS idx_payload_templates_category ON payload_templates(category);
 CREATE INDEX IF NOT EXISTS idx_technique_log_engagement ON technique_log(engagement_id);
+
+CREATE TABLE IF NOT EXISTS findings (
+    id               TEXT PRIMARY KEY,
+    engagement_id    TEXT NOT NULL REFERENCES engagements(id) ON DELETE CASCADE,
+    title            TEXT NOT NULL,
+    description      TEXT,
+    severity         TEXT NOT NULL DEFAULT 'info',
+    status           TEXT NOT NULL DEFAULT 'open',
+    target_host      TEXT,
+    target_url       TEXT,
+    mitre_attack_ids TEXT NOT NULL DEFAULT '[]',
+    skill_source     TEXT,
+    proof_of_concept TEXT,
+    remediation      TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_findings_engagement ON findings(engagement_id);
+CREATE INDEX IF NOT EXISTS idx_findings_severity ON findings(engagement_id, severity);
 "#;

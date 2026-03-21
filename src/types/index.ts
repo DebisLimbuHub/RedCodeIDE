@@ -202,3 +202,28 @@ export interface TechniqueLogEntry {
   notes: string | null;
   created_at: string;
 }
+
+// ---------------------------------------------------------------------------
+// Exploit — findings
+// ---------------------------------------------------------------------------
+
+export type FindingSeverity = "critical" | "high" | "medium" | "low" | "info";
+export type FindingStatus = "open" | "confirmed" | "false_positive" | "fixed";
+
+export interface Finding {
+  id: string;
+  engagement_id: string;
+  title: string;
+  description: string | null;
+  severity: FindingSeverity;
+  status: FindingStatus;
+  target_host: string | null;
+  target_url: string | null;
+  /** JSON-encoded string array of MITRE ATT&CK technique IDs. */
+  mitre_attack_ids: string;
+  skill_source: string | null;
+  proof_of_concept: string | null;
+  remediation: string | null;
+  created_at: string;
+  updated_at: string;
+}
