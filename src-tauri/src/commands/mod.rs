@@ -1,10 +1,16 @@
 mod engagement;
+pub mod exploit;
 mod recon;
 mod scope;
 mod terminal;
 
 pub use engagement::{
     archive_engagement, create_engagement, get_engagement, list_engagements, update_engagement,
+};
+pub use exploit::{
+    add_credential, delete_credential, delete_payload_template, get_attack_techniques,
+    list_credentials, list_payload_templates, list_technique_log, log_technique_used,
+    save_custom_payload, update_credential_status,
 };
 pub use recon::{
     add_recon_data, delete_recon_data, get_recon_data, get_recon_summary, import_recon_data,

@@ -121,3 +121,84 @@ export interface PaginatedReconData {
   page: number;
   per_page: number;
 }
+
+// ---------------------------------------------------------------------------
+// Exploit — credentials
+// ---------------------------------------------------------------------------
+
+export type CredentialStatus = "valid" | "invalid" | "untested";
+
+export interface Credential {
+  id: string;
+  engagement_id: string;
+  username: string;
+  password_or_hash: string | null;
+  hash_type: string | null;
+  source: string | null;
+  target_host: string | null;
+  target_service: string | null;
+  status: CredentialStatus;
+  notes: string | null;
+  created_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// Exploit — payload templates
+// ---------------------------------------------------------------------------
+
+export type PayloadCategory =
+  | "reverse_shell"
+  | "web_shell"
+  | "sqli"
+  | "xss"
+  | "command_injection"
+  | "privesc";
+
+export interface PayloadTemplate {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  platform: string;
+  language: string;
+  template_code: string;
+  /** JSON-encoded string array of variable names. */
+  variables: string;
+  is_custom: boolean;
+  created_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// Exploit — MITRE ATT&CK
+// ---------------------------------------------------------------------------
+
+export interface AttackSubTechnique {
+  id: string;
+  name: string;
+  description: string;
+}
+
+export interface AttackTechnique {
+  id: string;
+  name: string;
+  description: string;
+  platforms: string[];
+  suggested_tools: string[];
+  sub_techniques: AttackSubTechnique[];
+}
+
+export interface AttackTactic {
+  id: string;
+  name: string;
+  description: string;
+  techniques: AttackTechnique[];
+}
+
+export interface TechniqueLogEntry {
+  id: string;
+  engagement_id: string;
+  technique_id: string;
+  technique_name: string;
+  notes: string | null;
+  created_at: string;
+}

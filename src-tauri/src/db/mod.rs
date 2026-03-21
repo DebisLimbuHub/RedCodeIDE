@@ -80,4 +80,44 @@ CREATE TABLE IF NOT EXISTS recon_data (
 CREATE INDEX IF NOT EXISTS idx_recon_data_engagement ON recon_data(engagement_id);
 CREATE INDEX IF NOT EXISTS idx_recon_data_type ON recon_data(engagement_id, data_type);
 CREATE INDEX IF NOT EXISTS idx_recon_data_target ON recon_data(engagement_id, target_id);
+
+CREATE TABLE IF NOT EXISTS credentials (
+    id              TEXT PRIMARY KEY,
+    engagement_id   TEXT NOT NULL REFERENCES engagements(id) ON DELETE CASCADE,
+    username        TEXT NOT NULL,
+    password_or_hash TEXT,
+    hash_type       TEXT,
+    source          TEXT,
+    target_host     TEXT,
+    target_service  TEXT,
+    status          TEXT NOT NULL DEFAULT 'untested',
+    notes           TEXT,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payload_templates (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    category        TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    platform        TEXT NOT NULL,
+    language        TEXT NOT NULL,
+    template_code   TEXT NOT NULL,
+    variables       TEXT NOT NULL DEFAULT '[]',
+    is_custom       INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS technique_log (
+    id              TEXT PRIMARY KEY,
+    engagement_id   TEXT NOT NULL REFERENCES engagements(id) ON DELETE CASCADE,
+    technique_id    TEXT NOT NULL,
+    technique_name  TEXT NOT NULL,
+    notes           TEXT,
+    created_at      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credentials_engagement ON credentials(engagement_id);
+CREATE INDEX IF NOT EXISTS idx_payload_templates_category ON payload_templates(category);
+CREATE INDEX IF NOT EXISTS idx_technique_log_engagement ON technique_log(engagement_id);
 "#;
